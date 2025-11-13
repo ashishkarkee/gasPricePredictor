@@ -1,110 +1,231 @@
 import streamlit as st
 import pandas as pd
+import numpy as np
 from sklearn.linear_model import LinearRegression
+from sklearn.preprocessing import PolynomialFeatures
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import mean_absolute_error, r2_score
 import matplotlib.pyplot as plt
 from datetime import timedelta
 
-st.title("California Weekly Gas Price Predictor")
-st.write("Predicts weekly average gas prices in California using historical data and linear regression.")
+st.set_page_config(
+    page_title="CA Gas Price Predictor",
+    layout="wide"
+)
 
-# --- Load CSV ---
+st.title("California Weekly Gas Price Predictor")
+st.write(
+    "This app uses historical weekly gas prices in California and regression models "
+    "to predict future prices. Built with Python, Pandas, scikit-learn, and Streamlit."
+)
+
+# =========================
+# Data loading
+# =========================
 @st.cache_data
 def load_data():
-    df = pd.read_csv("gas_prices.csv")  # make sure the filename matches exactly
-    df['Date'] = pd.to_datetime(df['Date'])
-    df['Price'] = df['Price'].astype(float)
-    df = df.sort_values('Date').reset_index(drop=True)
+    # Make sure this filename matches the CSV in your repo
+    df = pd.read_csv("gas_prices.csv")
+    df["Date"] = pd.to_datetime(df["Date"])
+    df["Price"] = df["Price"].astype(float)
+    df = df.sort_values("Date").reset_index(drop=True)
+    df["WeekNum"] = range(len(df))  # simple time index
     return df
 
 df = load_data()
 
-# Feature engineering: simple time index
-df['WeekNum'] = range(len(df))
-X = df[['WeekNum']]
-y = df['Price']
+st.subheader("Historical Data Snapshot")
+col_info, col_stats = st.columns(2)
 
-# Train/test split (no shuffling to respect time order)
-X_train, X_test, y_train, y_test = train_test_split(
-    X, y, test_size=0.2, shuffle=False
+with col_info:
+    st.write(f"Number of weeks in dataset: **{len(df)}**")
+    st.write(f"Date range: **{df['Date'].iloc[0].date()} → {df['Date'].iloc[-1].date()}**")
+
+with col_stats:
+    st.write(f"Min price: **${df['Price'].min():.3f}**")
+    st.write(f"Max price: **${df['Price'].max():.3f}**")
+    st.write(f"Average price: **${df['Price'].mean():.3f}**")
+
+# =========================
+# Model selection
+# =========================
+st.subheader("Model Configuration")
+
+model_type = st.selectbox(
+    "Choose regression model",
+    ["Linear Regression", "Polynomial Regression"]
 )
 
-# Train model
-model = LinearRegression()
-model.fit(X_train, y_train)
-y_pred = model.predict(X_test)
+degree = 1
+if model_type == "Polynomial Regression":
+    degree = st.slider("Polynomial degree", min_value=2, max_value=4, value=2)
 
-# Evaluation metrics
+weeks_ahead = st.slider("Weeks into the future to predict", 1, 8, value=4)
+
+# =========================
+# Build features and train model
+# =========================
+X = df[["WeekNum"]]
+y = df["Price"]
+
+# Time-based train/test split (no shuffling)
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.3, shuffle=False
+)
+
+if model_type == "Linear Regression":
+    model = LinearRegression()
+    model.fit(X_train, y_train)
+    y_pred = model.predict(X_test)
+
+    # Future prediction
+    future_week_num = int(df["WeekNum"].iloc[-1] + weeks_ahead)
+    future_pred = model.predict([[future_week_num]])[0]
+
+    # Slope (rate of change per week)
+    slope = model.coef_[0]
+else:
+    # Polynomial features
+    poly = PolynomialFeatures(degree=degree, include_bias=False)
+    X_train_poly = poly.fit_transform(X_train)
+    X_test_poly = poly.transform(X_test)
+
+    model = LinearRegression()
+    model.fit(X_train_poly, y_train)
+    y_pred = model.predict(X_test_poly)
+
+    future_week_num = int(df["WeekNum"].iloc[-1] + weeks_ahead)
+    future_X_poly = poly.transform([[future_week_num]])
+    future_pred = model.predict(future_X_poly)[0]
+
+    # Effective slope near the end (finite difference)
+    if len(df) >= 2:
+        last_week = df["WeekNum"].iloc[-1]
+        prev_week = df["WeekNum"].iloc[-2]
+        last_X_poly = poly.transform([[last_week]])
+        prev_X_poly = poly.transform([[prev_week]])
+        slope = (model.predict(last_X_poly)[0] - model.predict(prev_X_poly)[0]) / (
+            last_week - prev_week
+        )
+    else:
+        slope = np.nan
+
+# =========================
+# Metrics
+# =========================
 mae = mean_absolute_error(y_test, y_pred)
 r2 = r2_score(y_test, y_pred)
-st.write(f"**Mean Absolute Error:** ${mae:.3f}")
-st.write(f"**R² (test set):** {r2:.3f}")
 
-# Slider to predict n weeks ahead
-weeks_ahead = st.slider("Weeks into the future to predict", 1, 8, value=4)
-future_week_num = len(df) + weeks_ahead - 1
-predicted_price = model.predict([[future_week_num]])[0]
-st.write(f"**Predicted average gas price in {weeks_ahead} week(s):** ${predicted_price:.3f}")
+st.subheader("Model Performance (on most recent test portion)")
+st.write(f"**Mean Absolute Error (MAE):** ${mae:.3f}")
+st.write(f"**R² score:** {r2:.3f}")
 
-# Most recent actual
-latest_date = df['Date'].iloc[-1]
-latest_price = df['Price'].iloc[-1]
-st.write(f"Most recent actual weekly average in California ({latest_date.strftime('%Y-%m-%d')}): **${latest_price:.3f}**")
+if not np.isnan(slope):
+    st.write(f"**Estimated weekly change in price:** {slope:+.4f} $/week")
 
-# --- Bar chart: Actual vs Predicted (test set + future prediction) ---
+# Residual-based uncertainty estimate
+residuals = y_test - y_pred
+if len(residuals) > 1:
+    sigma = residuals.std(ddof=1)
+    st.write(f"**Estimated prediction uncertainty (test residual std):** ±${sigma:.3f}")
 
-# Use indices of test set as x positions for historical bars
-comparison_weeks = X_test.index.to_list()
-actual_prices = y_test.values.tolist()
-predicted_prices = y_pred.tolist()
+# =========================
+# Latest actual + future prediction
+# =========================
+latest_date = df["Date"].iloc[-1]
+latest_price = df["Price"].iloc[-1]
+future_date = latest_date + timedelta(weeks=weeks_ahead)
 
-# Positions for bars
-actual_x = [i - 0.15 for i in comparison_weeks]
-pred_x = [i + 0.15 for i in comparison_weeks]
+st.subheader("Prediction")
+st.write(
+    f"Most recent actual weekly average in California "
+    f"({latest_date.strftime('%Y-%m-%d')}): **${latest_price:.3f}**"
+)
+st.write(
+    f"Predicted average gas price in **{weeks_ahead} week(s)** "
+    f"({future_date.strftime('%Y-%m-%d')}): **${future_pred:.3f}**"
+)
+
+# =========================
+# Visualization
+# =========================
+st.subheader("Historical and Predicted Prices")
 
 fig, ax = plt.subplots(figsize=(12, 6))
 
-# Bars for historical test data
-bars_actual = ax.bar(actual_x, actual_prices, width=0.3, label='Actual (test)', color='skyblue')
-bars_pred = ax.bar(pred_x, predicted_prices, width=0.3, label='Predicted (test)', color='orange')
+# All historical points (line)
+ax.plot(
+    df["WeekNum"],
+    df["Price"],
+    marker="o",
+    linestyle="-",
+    label="Historical actual",
+)
 
-# Single bar for future prediction
-future_x = future_week_num + 0.15
-bars_future = ax.bar(future_x, predicted_price, width=0.3,
-                     label=f'Predicted (+{weeks_ahead} weeks)', color='green')
+# Test period predictions (orange)
+ax.scatter(
+    X_test["WeekNum"],
+    y_pred,
+    color="orange",
+    s=80,
+    label="Model prediction (test segment)",
+)
 
-# X-axis labels: dates for test set + future date
-last_date = df['Date'].iloc[-1]
-dates_for_xticks = list(df['Date'].iloc[comparison_weeks])
-future_date = last_date + timedelta(weeks=weeks_ahead)
-dates_for_xticks.append(future_date)
+# Future prediction (green)
+ax.scatter(
+    future_week_num,
+    future_pred,
+    color="green",
+    s=120,
+    label=f"Future prediction (+{weeks_ahead} weeks)",
+)
 
-xtick_positions = comparison_weeks + [future_week_num]
-xtick_labels = [d.strftime('%Y-%m-%d') for d in dates_for_xticks]
+# X-axis labels as dates
+all_weeks = df["WeekNum"].tolist() + [future_week_num]
+all_dates = df["Date"].tolist() + [future_date]
+xtick_labels = [d.strftime("%Y-%m-%d") for d in all_dates]
 
-ax.set_xticks(xtick_positions)
-ax.set_xticklabels(xtick_labels, rotation=45, ha='right')
+ax.set_xticks(all_weeks)
+ax.set_xticklabels(xtick_labels, rotation=45, ha="right")
 
+ax.set_xlabel("Week")
 ax.set_ylabel("Price ($)")
-ax.set_title("Actual vs Predicted Weekly Gas Prices (California)")
+ax.set_title("California Weekly Gas Prices: Historical & Predicted")
 ax.legend()
-
-# Add value labels on top of bars
-for container in [bars_actual, bars_pred, bars_future]:
-    for bar in container:
-        height = bar.get_height()
-        ax.text(
-            bar.get_x() + bar.get_width() / 2,
-            height + 0.02,
-            f"{height:.2f}",
-            ha='center',
-            va='bottom',
-            fontsize=8
-        )
+ax.grid(alpha=0.3)
 
 st.pyplot(fig)
 
-# --- Optional: Show raw data table ---
-with st.expander("Show raw historical data"):
-    st.dataframe(df[['Date', 'Price']].rename(columns={'Date': 'Week', 'Price': 'Average Price ($)'}))
+# =========================
+# Extra info for your DS / applied math flex
+# =========================
+with st.expander("How this model works"):
+    st.markdown(
+        """
+        - Each week is converted into a numeric index (`WeekNum`), so the model can learn how price changes over time.
+        - We split the data into an **earlier training part** and a **more recent test part** without shuffling, 
+          which is important for time-series-like data.
+        - Depending on your choice:
+          - **Linear Regression** fits a straight line to prices over time.
+          - **Polynomial Regression** lets the model fit a curved trend of degree 2–4.
+        - We evaluate the model using:
+          - **Mean Absolute Error (MAE)** — average absolute difference between predictions and actual prices.
+          - **R²** — how much of the variation in price is explained by the model.
+        """
+    )
+
+with st.expander("Model limitations"):
+    st.markdown(
+        """
+        - The dataset currently has only a few weeks of prices, so the model is more of a demo than a production forecast.
+        - Real gas prices depend on many factors (oil markets, taxes, refinery issues, seasons), not just week number.
+        - A stronger model would add more historical data and more features, and it might use specialized time-series methods.
+        """
+    )
+
+with st.expander("View raw data"):
+    st.dataframe(
+        df[["Date", "Price"]].rename(
+            columns={"Date": "Week", "Price": "Average Price ($)"}
+        )
+    )
